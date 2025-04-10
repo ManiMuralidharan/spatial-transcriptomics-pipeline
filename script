@@ -1,0 +1,368 @@
+# --------------------------------------------------------------------------
+# 1. Setup and Installation
+# --------------------------------------------------------------------------
+
+# Install required packages (if not already installed)
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+packages_to_install <- c("Seurat", "STutility", "ggplot2", "patchwork", 
+                         "dplyr", "viridis", "spdep")
+
+for (pkg in packages_to_install) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    message(paste("Installing package:", pkg))
+    if (!BiocManager::install(pkg, update = FALSE, ask = FALSE)) {
+      stop(paste("Error: Failed to install package:", pkg))
+    }
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      stop(paste("Error: Failed to load package:", pkg))
+    }
+  }
+}
+
+# Load libraries
+library(Seurat)
+library(STutility)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(viridis)
+library(spdep)
+
+cat("Required packages installed and loaded successfully.\n")
+
+# --------------------------------------------------------------------------
+# 2. Data Loading
+# --------------------------------------------------------------------------
+
+# Load 10x Visium Data
+load_visium_data <- function(data_dir, sample_id, slice_name = "slice1", 
+                             matrix_filename = "filtered_feature_bc_matrix.h5") {
+  if (!dir.exists(data_dir)) {
+    stop(paste("Error: Data directory not found:", data_dir))
+  }
+  seurat_obj <- tryCatch({
+    Load10X_Spatial(
+      data.dir = data_dir,
+      filename = matrix_filename,
+      assay = "Spatial",
+      slice = slice_name,
+      filter.matrix = TRUE
+    )
+  }, error = function(e) {
+    stop(paste("Error loading 10x Visium data for", sample_id, ":", e$message))
+  })
+  
+  seurat_obj$sample <- sample_id
+  cat(paste("10x Visium data for sample", sample_id, "loaded from", file.path(data_dir, matrix_filename), "\n"))
+  return(seurat_obj)
+}
+
+# Load Multiple Samples
+load_multiple_samples <- function(info_table) {
+  required_columns <- c("samples", "spotfiles", "imgs", "json")
+  if (!all(required_columns %in% colnames(info_table))) {
+    stop("Error: info_table must contain columns 'samples', 'spotfiles', 'imgs', and 'json'.")
+  }
+
+  for (i in 1:nrow(info_table)) {
+    if (!file.exists(info_table$spotfiles[i]) || 
+        !file.exists(info_table$imgs[i]) || 
+        !file.exists(info_table$json[i])) {
+      stop(paste("Error: One or more required files not found for sample:", info_table$samples[i]))
+    }
+  }
+  
+  seurat_obj <- tryCatch({
+    InputFromTable(info_table)
+  }, error = function(e) {
+    stop(paste("Error loading multiple samples:", e$message))
+  })
+  
+  cat("Multiple samples loaded successfully.\n")
+  return(seurat_obj)
+}
+
+# --------------------------------------------------------------------------
+# 3. Quality Control and Preprocessing
+# --------------------------------------------------------------------------
+
+# QC Filtering Parameters
+feature_lower_threshold <- 200
+feature_upper_threshold <- 7500
+percent_mt_threshold <- 20
+n_variable_features <- 2000
+
+cat("Performing Quality Control and Preprocessing...\n")
+
+# Add mitochondrial percentage
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-")
+cat("Mitochondrial percentage added.\n")
+
+# QC metrics visualization
+qc_plot <- VlnPlot(seurat_obj, features = c("nFeature_Spatial", "nCount_Spatial", "percent.mt"),
+                    pt.size = 0.1, ncol = 3) & theme(plot.title = element_text(size = 10))
+print(qc_plot)
+cat("QC metrics visualized (nFeature_Spatial, nCount_Spatial, percent.mt).\n")
+
+# Function for QC filtering
+filter_seurat_object <- function(seurat_obj, feature_lower, feature_upper, percent_mt) {
+  subset(seurat_obj,
+         nFeature_Spatial > feature_lower &
+         nFeature_Spatial < feature_upper &
+         percent.mt < percent_mt)
+}
+
+# Filter based on QC metrics
+seurat_obj <- filter_seurat_object(seurat_obj, feature_lower_threshold,
+                                   feature_upper_threshold, percent_mt_threshold)
+cat(paste("Data filtered based on QC metrics (nFeature >", feature_lower_threshold,
+          ", nFeature <", feature_upper_threshold, ", percent.mt <", percent_mt_threshold, ").\n"))
+
+# Normalize data
+seurat_obj <- NormalizeData(seurat_obj)
+cat("Data normalized using LogNormalize.\n")
+
+# Identify variable features
+seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = n_variable_features)
+cat(paste(n_variable_features, "variable features identified.\n"))
+
+# Scale data
+seurat_obj <- ScaleData(seurat_obj)
+cat("Data scaled.\n")
+
+# --------------------------------------------------------------------------
+# 4. Dimensionality Reduction and Clustering
+# --------------------------------------------------------------------------
+
+# Clustering Parameters
+n_pcs_pca <- 30
+n_dims_umap_tsne_reduction <- 1:20
+n_neighbors_clustering <- 20
+resolution_clustering <- 0.8
+clustering_algorithm <- 3 # Louvain algorithm
+
+cat("Performing Dimensionality Reduction and Clustering (using Louvain algorithm)...\n")
+
+# PCA
+seurat_obj <- RunPCA(seurat_obj, npcs = n_pcs_pca)
+cat(paste("PCA performed with", n_pcs_pca, "principal components.\n"))
+
+# UMAP/tSNE
+seurat_obj <- RunUMAP(seurat_obj, dims = n_dims_umap_tsne_reduction)
+seurat_obj <- RunTSNE(seurat_obj, dims = n_dims_umap_tsne_reduction)
+cat(paste("UMAP and t-SNE performed using dimensions.",
+          paste(n_dims_umap_tsne_reduction, collapse = ", "), ".\n"))
+
+# Clustering
+seurat_obj <- FindNeighbors(seurat_obj, dims = n_dims_umap_tsne_reduction, k = n_neighbors_clustering)
+seurat_obj <- FindClusters(seurat_obj, resolution = resolution_clustering, algorithm = clustering_algorithm)
+cat(paste("Clustering performed with resolution", resolution_clustering,
+          "and", n_neighbors_clustering, "neighbors (using Louvain algorithm).\n"))
+
+# Visualization
+umap_plot <- DimPlot(seurat_obj, reduction = "umap", label = TRUE)
+spatial_umap_plot <- SpatialDimPlot(seurat_obj, label = TRUE, label.size = 3)
+combined_umap_plot <- umap_plot + spatial_umap_plot
+print(combined_umap_plot)
+cat("UMAP and spatial UMAP plots generated.\n")
+
+# --------------------------------------------------------------------------
+# 5. Spatial Analysis
+# --------------------------------------------------------------------------
+
+# Spatial Analysis Parameters
+moran_k_neighbors <- 6
+n_top_variable_features <- 1000
+n_top_show_svgs <- 6
+
+cat("Performing Spatial Analysis...\n")
+
+# Spatial Variable Genes
+cat("Identifying spatially variable genes using Moran's I...\n")
+seurat_obj <- FindSpatiallyVariableFeatures(
+  seurat_obj,
+  assay = "Spatial",
+  selection.method = "moransi",
+  features = VariableFeatures(seurat_obj)[1:min(n_top_variable_features, length(VariableFeatures(seurat_obj)))],
+  n.top.show = 200,
+  n.top = 10
+)
+cat("Spatially variable genes identified.\n")
+
+# Handle potential case with no spatially variable genes
+top_svgs <- SpatiallyVariableFeatures(seurat_obj, selection.method = "moransi")
+if (length(top_svgs) > 0) {
+  top_svgs_to_plot <- head(top_svgs, n_top_show_svgs)
+  spatial_svg_plot <- SpatialFeaturePlot(seurat_obj, features = top_svgs_to_plot, ncol = 3, alpha = c(0.1, 1))
+  print(spatial_svg_plot)
+  cat(paste("Top", length(top_svgs_to_plot), "spatially variable genes plotted.\n"))
+} else {
+  cat("No spatially variable genes found with the current parameters.\n")
+}
+
+# Spatial Neighborhood Analysis
+cat("Performing spatial autocorrelation analysis using Moran's I...\n")
+coords <- GetTissueCoordinates(seurat_obj)
+knn <- knn2nb(knearneigh(as.matrix(coords[, c("imagerow", "imagecol")]), k = moran_k_neighbors))
+spatial_weights <- nb2listw(knn)
+cat(paste("K-nearest neighbors (k=", moran_k_neighbors, ") and spatial weights calculated.\n"))
+
+n_genes_moran <- min(100, length(VariableFeatures(seurat_obj)))
+moran_results <- lapply(VariableFeatures(seurat_obj)[1:n_genes_moran], function(gene) {
+  moran.test(GetAssayData(seurat_obj, slot = "data")[gene, ], spatial_weights)
+})
+
+# Results Data Frame
+moran_df <- data.frame(
+  gene = VariableFeatures(seurat_obj)[1:n_genes_moran],
+  moran_i = sapply(moran_results, function(x) ifelse(length(x$estimate) > 0, x$estimate[1], NA)),
+  p_value = sapply(moran_results, function(x) ifelse(length(x$p.value) > 0, x$p.value, NA))
+)
+
+moran_df <- moran_df[!is.na(moran_df$moran_i), ] # Remove NA rows
+moran_df <- moran_df[order(-moran_df$moran_i), ]
+top_moran_genes <- head(moran_df$gene, n_top_show_svgs)
+spatial_moran_plot <- SpatialFeaturePlot(seurat_obj, features = top_moran_genes, ncol = 3, alpha = c(0.1, 1))
+print(spatial_moran_plot)
+cat(paste("Top", n_top_show_svgs, "spatially autocorrelated genes (Moran's I) plotted.\n"))
+
+# --------------------------------------------------------------------------
+# 6. Integration with Single-Cell Data (Optional)
+# --------------------------------------------------------------------------
+
+integrate_scRNAseq <- FALSE # Set to TRUE if you have reference single-cell data
+if (integrate_scRNAseq) {
+  cat("Performing integration with single-cell data...\n")
+  # Load reference single-cell data
+  reference_path <- "path/to/single_cell_reference.rds" # Replace with your path
+  if (!file.exists(reference_path)) {
+    stop(paste("Error: Reference single-cell data not found at:", reference_path))
+  }
+  
+  reference <- readRDS(reference_path)
+  cat("Reference single-cell data loaded.\n")
+
+  # Anchor-based integration
+  n_dims_integration <- 1:30
+  anchors <- FindTransferAnchors(
+    reference = reference,
+    query = seurat_obj,
+    normalization.method = "SCT",
+    dims = n_dims_integration
+  )
+  cat("Transfer anchors found.\n")
+
+  # Transfer cell type labels
+  predictions <- TransferData(
+    anchorset = anchors,
+    refdata = reference$celltype,
+    dims = n_dims_integration
+  )
+  seurat_obj <- AddMetaData(seurat_obj, metadata = predictions)
+  cat("Cell type labels transferred.\n")
+
+  # Visualize predicted cell types
+  spatial_predicted_plot <- SpatialDimPlot(seurat_obj, group.by = "predicted.id", pt.size.factor = 1.5)
+  print(spatial_predicted_plot)
+  cat("Spatial plot of predicted cell types generated.\n")
+} else {
+  cat("Skipping integration with single-cell data.\n")
+}
+
+# --------------------------------------------------------------------------
+# 7. Advanced Analysis: Spatial Domains
+# --------------------------------------------------------------------------
+
+# Spatial Domain Parameters
+n_dims_spatial_domains_pca <- 1:20
+resolution_spatial_domains <- 0.6
+algorithm_spatial_domains <- 3 # Louvain algorithm
+
+cat("Performing advanced analysis: Spatial Domains (using Louvain algorithm)...\n")
+
+# Identify spatial domains
+cat(paste("Using Louvain algorithm (algorithm =", algorithm_spatial_domains,
+          ") for spatial domain identification.\n"))
+seurat_obj <- FindSpatialDomains(
+  seurat_obj,
+  reduction = "pca",
+  dims = n_dims_spatial_domains_pca,
+  resolution = resolution_spatial_domains,
+  algorithm = algorithm_spatial_domains
+)
+cat(paste("Spatial domains identified with resolution", resolution_spatial_domains,
+          "using PCA dimensions", paste(n_dims_spatial_domains_pca, collapse = ", "), ".\n"))
+
+# Plot spatial domains
+spatial_domains_plot <- SpatialDimPlot(seurat_obj, group.by = "spatial_domain", pt.size.factor = 1.5)
+print(spatial_domains_plot)
+cat("Spatial plot of identified domains generated.\n")
+
+# Find domain markers
+domain_markers <- FindAllMarkers(
+  seurat_obj,
+  assay = "Spatial",
+  group.by = "spatial_domain",
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+cat("Marker genes for each spatial domain identified.\n")
+print(head(domain_markers))
+
+# --------------------------------------------------------------------------
+# 8. Saving Results
+# --------------------------------------------------------------------------
+
+# Saving Individual Plots Option
+save_individual_plots <- FALSE # Set to TRUE to save individual plots
+
+cat("Saving results...\n")
+
+# Save Seurat object
+output_rds_file <- "processed_spatial_transcriptomics.rds"
+saveRDS(seurat_obj, file = output_rds_file)
+cat(paste("Seurat object saved to:", output_rds_file, "\n"))
+
+# Save marker genes
+output_markers_file <- "spatial_domain_markers.csv"
+write.csv(domain_markers, output_markers_file, row.names = FALSE)
+cat(paste("Spatial domain marker genes saved to:", output_markers_file, "\n"))
+
+# Save spatial plots to a single PDF
+output_pdf_file <- "spatial_plots.pdf"
+pdf(output_pdf_file)
+print(spatial_cluster_plot)
+print(spatial_gene_plot)
+print(spatial_svg_plot)
+print(spatial_moran_plot)
+if (integrate_scRNAseq) {
+  print(spatial_predicted_plot)
+}
+print(spatial_domains_plot)
+dev.off()
+cat(paste("Spatial plots saved to:", output_pdf_file, "\n"))
+
+# Save individual plots if the option is enabled
+if (save_individual_plots) {
+  ggsave("spatial_cluster_plot.png", spatial_cluster_plot, width = 10, height = 8)
+  ggsave("spatial_gene_plot.png", spatial_gene_plot, width = 12, height = 6)
+  ggsave("spatial_svg_plot.png", spatial_svg_plot, width = 12, height = 6)
+  ggsave("spatial_moran_plot.png", spatial_moran_plot, width = 12, height = 6)
+  if (integrate_scRNAseq) {
+    ggsave("spatial_predicted_plot.png", spatial_predicted_plot, width = 12, height = 6)
+  }
+  ggsave("spatial_domains_plot.png", spatial_domains_plot, width = 12, height = 6)
+}
+
+# --------------------------------------------------------------------------
+# 9. Session Information (for reproducibility)
+# --------------------------------------------------------------------------
+
+cat("\n--- Session Information ---\n")
+sessionInfo()
+
+cat("Script finished successfully!\n")
